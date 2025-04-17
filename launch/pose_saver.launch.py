@@ -10,7 +10,8 @@ def generate_launch_description():
             output='screen',
             parameters=[
                 {'save_interval_sec': 5.0},
-                {'pose_file_path': '/tmp/pose_saver.yaml'}
+                {'pose_file_path': '/tmp/pose_saver.yaml'},
+                {'use_sim_time': True}  # optional, depending on sim usage
             ]
         )
     ])

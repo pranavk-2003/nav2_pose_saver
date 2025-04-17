@@ -1,15 +1,13 @@
 #include <chrono>
 #include <fstream>
 #include <memory>
-#include <cstdio>  // for std::rename
+#include <cstdio>
 #include <rclcpp/rclcpp.hpp>
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <std_srvs/srv/trigger.hpp>
 #include <yaml-cpp/yaml.h>
 #include <ament_index_cpp/get_package_share_directory.hpp>
 #include "nav2_pose_saver/pose_saver_node.hpp"
-
-
 
 using namespace std::chrono_literals;
 
@@ -21,9 +19,13 @@ PoseSaverNode::PoseSaverNode()
 {
   this->declare_parameter<double>("save_interval_sec", 5.0);
   this->declare_parameter<std::string>("pose_file_path", std::string(std::getenv("HOME")) + "/.ros/last_known_pose.yaml");
+  this->declare_parameter<bool>("auto_start_saving", true);
+  this->declare_parameter<bool>("auto_restore_pose", true);
 
   pose_file_path_ = this->get_parameter("pose_file_path").as_string();
   double interval_sec = this->get_parameter("save_interval_sec").as_double();
+  bool auto_start = this->get_parameter("auto_start_saving").as_bool();
+  auto_restore_ = this->get_parameter("auto_restore_pose").as_bool();
 
   timer_ = this->create_wall_timer(
     std::chrono::duration<double>(interval_sec),
@@ -33,6 +35,8 @@ PoseSaverNode::PoseSaverNode()
   sub_ = this->create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
     "/amcl_pose", 10,
     std::bind(&PoseSaverNode::pose_callback, this, std::placeholders::_1));
+
+  initial_pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>("/initialpose", 10);
 
   start_service_ = this->create_service<std_srvs::srv::Trigger>(
     "/start_pose_saver",
@@ -46,6 +50,53 @@ PoseSaverNode::PoseSaverNode()
     "/localise_at_last_known_position",
     std::bind(&PoseSaverNode::restore_service_cb, this, std::placeholders::_1, std::placeholders::_2));
 
+  reset_service_ = this->create_service<std_srvs::srv::Trigger>(
+    "/reset_last_known_pose",
+    std::bind(&PoseSaverNode::reset_pose_file_cb, this, std::placeholders::_1, std::placeholders::_2));
+
+  if (auto_start) {
+    saving_active_ = true;
+    timer_->reset();
+    RCLCPP_INFO(this->get_logger(), "Pose saving auto-started on launch.");
+  }
+
+  if (auto_restore_) {
+    RCLCPP_INFO(this->get_logger(), "Auto-restore enabled. Waiting for AMCL...");
+  
+    // Wait for sim time to become active
+    if (this->get_parameter_or("use_sim_time", false)) {
+      RCLCPP_INFO(this->get_logger(), "Waiting for /clock to start (sim time)...");
+      while (rclcpp::ok() && this->now().nanoseconds() == 0) {
+        rclcpp::sleep_for(100ms);
+      }
+    }
+  
+    // Wait for AMCL to subscribe to /initialpose
+    rclcpp::Time start = this->now();
+    rclcpp::Duration timeout = rclcpp::Duration::from_seconds(15.0);
+    while (initial_pose_pub_->get_subscription_count() == 0 &&
+           (this->now() - start) < timeout)
+    {
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                           "Waiting for AMCL to subscribe to /initialpose...");
+      rclcpp::sleep_for(200ms);
+    }
+  
+    if (initial_pose_pub_->get_subscription_count() == 0) {
+      RCLCPP_ERROR(this->get_logger(), "Timeout: AMCL did not subscribe to /initialpose.");
+    } else {
+      try {
+        auto pose_msg = read_pose_from_file(pose_file_path_);
+        rclcpp::sleep_for(500ms);
+        initial_pose_pub_->publish(pose_msg);
+        RCLCPP_INFO(this->get_logger(), "Auto-restored initial pose from file.");
+      } catch (const std::exception &e) {
+        RCLCPP_WARN(this->get_logger(), "Failed auto-restore: %s", e.what());
+      }
+    }
+  }
+  
+
   RCLCPP_INFO(this->get_logger(), "Pose Saver Node Initialized.");
 }
 
@@ -56,15 +107,14 @@ void PoseSaverNode::pose_callback(const geometry_msgs::msg::PoseWithCovarianceSt
 
 void PoseSaverNode::timer_callback()
 {
-  if (!saving_active_ || !last_pose_)
-    return;
+  if (!saving_active_ || !last_pose_) return;
 
   try {
-    write_pose_to_file(pose_file_path_);
+    write_pose_to_file("/tmp/pose_saver.yaml");
     write_pose_to_file(get_package_config_path());
-    RCLCPP_DEBUG(this->get_logger(), "Saved pose to %s and config dir", pose_file_path_.c_str());
+    RCLCPP_DEBUG(this->get_logger(), "Saved pose to /tmp and config path.");
   } catch (const std::exception &e) {
-    RCLCPP_ERROR(this->get_logger(), "Failed to write pose: %s", e.what());
+    RCLCPP_ERROR(this->get_logger(), "Failed to save pose: %s", e.what());
   }
 }
 
@@ -77,7 +127,6 @@ void PoseSaverNode::start_service_cb(
   timer_->reset();
   res->success = true;
   res->message = "Pose saving started.";
-  RCLCPP_INFO(this->get_logger(), "Pose saving activated.");
 }
 
 void PoseSaverNode::stop_service_cb(
@@ -89,7 +138,6 @@ void PoseSaverNode::stop_service_cb(
   timer_->cancel();
   res->success = true;
   res->message = "Pose saving stopped.";
-  RCLCPP_INFO(this->get_logger(), "Pose saving deactivated.");
 }
 
 void PoseSaverNode::restore_service_cb(
@@ -98,17 +146,63 @@ void PoseSaverNode::restore_service_cb(
 {
   (void)req;
   try {
-    geometry_msgs::msg::PoseWithCovarianceStamped pose_msg = read_pose_from_file(pose_file_path_);
-    auto pub = this->create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>("/initialpose", 10);
-    rclcpp::sleep_for(500ms);  // wait for AMCL to be ready
-    pub->publish(pose_msg);
+    auto pose_msg = read_pose_from_file(pose_file_path_);
+    rclcpp::sleep_for(500ms);
+    initial_pose_pub_->publish(pose_msg);
     res->success = true;
-    res->message = "Pose restored.";
-    RCLCPP_INFO(this->get_logger(), "Published initial pose from file.");
+    res->message = "Pose restored from file.";
+    RCLCPP_INFO(this->get_logger(), "Pose restored from file.");
   } catch (const std::exception &e) {
     res->success = false;
     res->message = e.what();
-    RCLCPP_ERROR(this->get_logger(), "Failed to restore pose: %s", e.what());
+    RCLCPP_WARN(this->get_logger(), "Failed to restore pose: %s", e.what());
+  }
+}
+
+void PoseSaverNode::reset_pose_file_cb(
+  const std::shared_ptr<std_srvs::srv::Trigger::Request> req,
+  std::shared_ptr<std_srvs::srv::Trigger::Response> res)
+{
+  (void)req;
+  try {
+    YAML::Emitter out;
+    out << YAML::BeginMap;
+    out << YAML::Key << "pose" << YAML::BeginMap;
+    out << YAML::Key << "position" << YAML::BeginMap
+        << YAML::Key << "x" << YAML::Value << 0.0
+        << YAML::Key << "y" << YAML::Value << 0.0
+        << YAML::Key << "z" << YAML::Value << 0.0
+        << YAML::EndMap;
+    out << YAML::Key << "orientation" << YAML::BeginMap
+        << YAML::Key << "x" << YAML::Value << 0.0
+        << YAML::Key << "y" << YAML::Value << 0.0
+        << YAML::Key << "z" << YAML::Value << 0.0
+        << YAML::Key << "w" << YAML::Value << 1.0
+        << YAML::EndMap;
+    out << YAML::EndMap;
+    out << YAML::EndMap;
+
+    std::vector<std::string> paths = {
+      "/tmp/pose_saver.yaml",
+      get_package_config_path(),
+      pose_file_path_
+    };
+
+    for (const auto& path : paths) {
+      std::string tmp_path = path + ".tmp";
+      std::ofstream tmp_out(tmp_path);
+      tmp_out << out.c_str();
+      tmp_out.close();
+      std::rename(tmp_path.c_str(), path.c_str());
+    }
+
+    res->success = true;
+    res->message = "Pose reset to zeros.";
+    RCLCPP_INFO(this->get_logger(), "Pose reset to default in all paths.");
+  } catch (const std::exception &e) {
+    res->success = false;
+    res->message = e.what();
+    RCLCPP_ERROR(this->get_logger(), "Failed to reset pose: %s", e.what());
   }
 }
 
@@ -119,31 +213,26 @@ void PoseSaverNode::write_pose_to_file(const std::string &filepath)
   YAML::Emitter out;
   out << YAML::BeginMap;
   out << YAML::Key << "pose" << YAML::BeginMap;
-  out << YAML::Key << "position" << YAML::BeginMap;
-  out << YAML::Key << "x" << YAML::Value << last_pose_->pose.pose.position.x;
-  out << YAML::Key << "y" << YAML::Value << last_pose_->pose.pose.position.y;
-  out << YAML::Key << "z" << YAML::Value << last_pose_->pose.pose.position.z;
-  out << YAML::EndMap;
-  out << YAML::Key << "orientation" << YAML::BeginMap;
-  out << YAML::Key << "x" << YAML::Value << last_pose_->pose.pose.orientation.x;
-  out << YAML::Key << "y" << YAML::Value << last_pose_->pose.pose.orientation.y;
-  out << YAML::Key << "z" << YAML::Value << last_pose_->pose.pose.orientation.z;
-  out << YAML::Key << "w" << YAML::Value << last_pose_->pose.pose.orientation.w;
-  out << YAML::EndMap;
+  out << YAML::Key << "position" << YAML::BeginMap
+      << YAML::Key << "x" << YAML::Value << last_pose_->pose.pose.position.x
+      << YAML::Key << "y" << YAML::Value << last_pose_->pose.pose.position.y
+      << YAML::Key << "z" << YAML::Value << last_pose_->pose.pose.position.z
+      << YAML::EndMap;
+  out << YAML::Key << "orientation" << YAML::BeginMap
+      << YAML::Key << "x" << YAML::Value << last_pose_->pose.pose.orientation.x
+      << YAML::Key << "y" << YAML::Value << last_pose_->pose.pose.orientation.y
+      << YAML::Key << "z" << YAML::Value << last_pose_->pose.pose.orientation.z
+      << YAML::Key << "w" << YAML::Value << last_pose_->pose.pose.orientation.w
+      << YAML::EndMap;
   out << YAML::EndMap;
   out << YAML::EndMap;
 
   std::string tmp_path = filepath + ".tmp";
-  std::ofstream tmp_out(tmp_path, std::ios::trunc);
-  if (!tmp_out.is_open()) {
-    throw std::runtime_error("Unable to open temp file for writing: " + tmp_path);
-  }
+  std::ofstream tmp_out(tmp_path);
   tmp_out << out.c_str();
   tmp_out.close();
 
-  if (std::rename(tmp_path.c_str(), filepath.c_str()) != 0) {
-    throw std::runtime_error("Failed to rename temp file to target file: " + filepath);
-  }
+  std::rename(tmp_path.c_str(), filepath.c_str());
 }
 
 geometry_msgs::msg::PoseWithCovarianceStamped PoseSaverNode::read_pose_from_file(const std::string &filepath)
@@ -164,11 +253,10 @@ geometry_msgs::msg::PoseWithCovarianceStamped PoseSaverNode::read_pose_from_file
 
 std::string PoseSaverNode::get_package_config_path()
 {
-  std::string package_share = ament_index_cpp::get_package_share_directory("pose_saver");
-  return package_share + "/config/last_known_pose.yaml";
+  return ament_index_cpp::get_package_share_directory("nav2_pose_saver") + "/config/last_known_pose.yaml";
 }
 
-}  
+}  // namespace nav2_pose_saver
 
 int main(int argc, char **argv)
 {
