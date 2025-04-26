@@ -45,9 +45,10 @@ When `auto_restore_pose` is set to `true`, the node will automatically re-publis
 
 ## Demo
 
-[![Pose Saver Demo](https://img.youtube.com/vi/<5MWCmIjoQk0>/0.jpg)](https://youtu.be/5MWCmIjoQk0)
+[![Pose Saver Demo](https://img.youtube.com/vi/5MWCmIjoQk0/0.jpg)](https://www.youtube.com/watch?v=5MWCmIjoQk0)
 
-> Click the image above to watch the video demonstration on YouTube.
+> 📽️ Click the image above to watch the demonstration on YouTube.
+
 
 ---
 
