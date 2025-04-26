@@ -1,0 +1,6 @@
+{
+    "python.autoComplete.extraPaths": [
+        "/opt/ros/jazzy/lib/python/site-packages",
+        "/opt/ros/jazzy/lib/python3.12/site-packages"
+    ]
+}
