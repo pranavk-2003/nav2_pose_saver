@@ -43,6 +43,12 @@ ros2 launch nav2_pose_saver pose_saver.launch.py
 
 When `auto_restore_pose` is set to `true`, the node will automatically re-publish the last known pose whenever AMCL reconnects — even after navigation crashes or restarts.
 
+## Demo
+
+[![Pose Saver Demo](https://img.youtube.com/vi/<5MWCmIjoQk0>/0.jpg)](https://youtu.be/5MWCmIjoQk0)
+
+> Click the image above to watch the video demonstration on YouTube.
+
 ---
 
 ## Parameters
